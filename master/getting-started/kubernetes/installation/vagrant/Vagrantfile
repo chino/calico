@@ -1,3 +1,6 @@
+# vim: set ts=2 sw=2 et ft=ruby :
+# rubocop: disable all
+
 # Size of the cluster created by Vagrant
 num_instances=3
 
@@ -41,6 +44,11 @@ Vagrant.configure("2") do |config|
       host.vm.provision :shell, :inline => "sudo /usr/bin/ip addr flush dev eth1"
       host.vm.provision :shell, :inline => "sudo /usr/bin/ip addr add #{ip}/24 dev eth1"
 
+      # port forwards because things like cisco vpn client breaks host-only networking
+      # access web ui using http://localhost:8080
+      forward = i == 1 ? 8080 : i == 2 ? 3002 : nil
+      host.vm.network "forwarded_port", guest: forward, host: forward if forward
+
       if i == 1
         # Configure the master.
         host.vm.provision :file, :source => "master-config.yaml", :destination => "/tmp/vagrantfile-user-data"
@@ -48,11 +56,94 @@ Vagrant.configure("2") do |config|
 
         host.vm.provision :shell, :inline => "echo '127.0.0.1\tlocalhost' > /etc/hosts", :privileged => true
         host.vm.provision :shell, :inline => "mkdir -p /etc/kubernetes/manifests/", :privileged => true
+
+        # add vagrant folder for easy access
+        host.vm.provision :file, :source => ".", :destination => "/home/core/vagrant"
+
+        # setup bash completion for kubectl
+        host.vm.provision :file, :source => "/usr/local/etc/bash_completion", :destination => "/home/core/bash_completion"
+        host.vm.provision :shell, :inline => "
+          set -ex
+          sed -i 's!/usr/local/etc/bash_completion!/home/core/bash_completion!g' /home/core/bash_completion
+          echo '
+            source /home/core/bash_completion
+            source <(kubectl completion bash)
+          ' > /etc/profile.d/completion
+          unlink /home/core/.bashrc
+          echo '
+            source /etc/profile.d/*
+          ' >> /home/core/.bashrc
+        ", :privileged => true
+
       else
         # Configure a node.
         host.vm.provision :file, :source => "node-config.yaml", :destination => "/tmp/vagrantfile-user-data"
         host.vm.provision :shell, :inline => "mv /tmp/vagrantfile-user-data /var/lib/coreos-vagrant/", :privileged => true
       end
+
+      host.vm.provision :shell, :inline => "
+        set -ex
+
+        echo downloading calicoctl
+        curl -L -O https://github.com/projectcalico/calicoctl/releases/download/v1.3.0/calicoctl
+        chmod +x calicoctl
+        mkdir -p /opt/bin
+        mv calicoctl /opt/bin
+
+        echo 'waiting for systemd to finish starting'
+        files=(kube-proxy kubelet)
+        [[ #{i} == 1 ]] &&
+          files+=(kube-apiserver kube-controller-manager kube-scheduler kubectl)
+        for file in ${files[*]}; do while ! [[ -e /opt/bin/$file ]]; do sleep 1; done; done
+
+        echo waiting for kubernetes api to be reachable
+        while ! curl -S -s -L http://172.18.18.101:8080 >/dev/null; do sleep 1; done
+
+        echo waiting for etcd to be reachable
+        while ! curl -S -s -L http://172.18.18.101:2379 >/dev/null; do sleep 1; done
+
+        echo checking etcd version
+        curl -L http://172.18.18.101:2379/version
+
+        echo checking docker
+        docker ps
+
+        if [[ #{i} == 1 ]]; then
+          echo setting up kubectl
+          kubectl config set-cluster vagrant-cluster --server=http://172.18.18.101:8080
+          kubectl config set-context vagrant-system --cluster=vagrant-cluster
+          kubectl config use-context vagrant-system
+
+          echo installing calico
+          kubectl apply -f http://docs.projectcalico.org/v2.3/getting-started/kubernetes/installation/hosted/calico.yaml
+          kubectl get pods --all-namespaces
+        fi
+
+        echo checking calico
+        while ! calicoctl node status; do sleep 1; done
+
+        if [[ #{i} == 1 ]]; then
+          echo installing skydns
+          kubectl apply -f http://docs.projectcalico.org/v2.3/getting-started/kubernetes/installation/manifests/skydns.yaml
+          kubectl get pods --all-namespaces
+
+          echo installing k8 dashboard
+          kubectl apply -f https://rawgit.com/kubernetes/dashboard/master/src/deploy/kubernetes-dashboard.yaml
+          kubectl get pods --all-namespaces
+
+          echo installing heapster for container metrics and graphs in ui
+          [[ -d heapster ]] ||
+            git clone https://github.com/kubernetes/heapster.git
+          (
+            cd heapster/deploy/kube-config/influxdb
+            kubectl apply -f .
+            kubectl get pods --all-namespaces
+          )
+        fi
+
+        true
+      "
+
     end
   end
 end
